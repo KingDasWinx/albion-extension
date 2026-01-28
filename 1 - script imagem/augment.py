@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
+from concurrent.futures import ThreadPoolExecutor
 
 
 def list_images(input_dir, exts=(".png", ".jpg", ".jpeg", ".bmp", ".webp")):
@@ -34,6 +35,13 @@ def rotate_and_crop(img, angle):
     return crop
 
 
+def to_white_background(img):
+    if "A" in img.getbands():
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        return Image.alpha_composite(bg, img).convert("RGB")
+    return img
+
+
 def random_resize_with_pad_or_crop(img, rng):
     w0, h0 = img.size
     scale = rng.uniform(0.85, 1.25)
@@ -48,8 +56,11 @@ def random_resize_with_pad_or_crop(img, rng):
         cropped = resized.crop((left, top, left + w0, top + h0))
         return cropped
     else:
-        bg_color = tuple(rng.randint(0, 20) for _ in range(3))
-        background = Image.new("RGB", (w0, h0), bg_color)
+        if "A" in img.getbands():
+            background = Image.new("RGBA", (w0, h0), (0, 0, 0, 0))
+        else:
+            bg_color = tuple(rng.randint(0, 20) for _ in range(3))
+            background = Image.new("RGB", (w0, h0), bg_color)
         max_x = w0 - new_w
         max_y = h0 - new_h
         left = rng.randint(0, max(0, max_x))
@@ -62,63 +73,131 @@ def color_jitter(img, rng):
     b = rng.uniform(0.6, 1.4)
     c = rng.uniform(0.6, 1.4)
     s = rng.uniform(0.6, 1.4)
-    img = ImageEnhance.Brightness(img).enhance(b)
-    img = ImageEnhance.Contrast(img).enhance(c)
-    img = ImageEnhance.Color(img).enhance(s)
-    return img
+    if "A" in img.getbands():
+        a = img.getchannel("A")
+        rgb = img.convert("RGB")
+        rgb = ImageEnhance.Brightness(rgb).enhance(b)
+        rgb = ImageEnhance.Contrast(rgb).enhance(c)
+        rgb = ImageEnhance.Color(rgb).enhance(s)
+        r, g, bch = rgb.split()
+        return Image.merge("RGBA", (r, g, bch, a))
+    else:
+        img = ImageEnhance.Brightness(img).enhance(b)
+        img = ImageEnhance.Contrast(img).enhance(c)
+        img = ImageEnhance.Color(img).enhance(s)
+        return img
 
 
 def adjust_hsv(img, rng):
-    hsv = img.convert("HSV")
-    arr = np.array(hsv).astype(np.int16)
-    h_shift = rng.randint(-40, 40)
-    s_scale = rng.uniform(0.7, 1.3)
-    v_scale = rng.uniform(0.7, 1.3)
-    arr[..., 0] = (arr[..., 0] + h_shift) % 256
-    arr[..., 1] = np.clip(np.round(arr[..., 1] * s_scale), 0, 255)
-    arr[..., 2] = np.clip(np.round(arr[..., 2] * v_scale), 0, 255)
-    out = Image.fromarray(arr.astype(np.uint8), mode="HSV").convert("RGB")
-    return out
+    if "A" in img.getbands():
+        a = img.getchannel("A")
+        rgb = img.convert("RGB")
+        hsv = rgb.convert("HSV")
+        arr = np.array(hsv).astype(np.int16)
+        h_shift = rng.randint(-40, 40)
+        s_scale = rng.uniform(0.7, 1.3)
+        v_scale = rng.uniform(0.7, 1.3)
+        arr[..., 0] = (arr[..., 0] + h_shift) % 256
+        arr[..., 1] = np.clip(np.round(arr[..., 1] * s_scale), 0, 255)
+        arr[..., 2] = np.clip(np.round(arr[..., 2] * v_scale), 0, 255)
+        out_rgb = Image.fromarray(arr.astype(np.uint8), mode="HSV").convert("RGB")
+        r, g, b = out_rgb.split()
+        return Image.merge("RGBA", (r, g, b, a))
+    else:
+        hsv = img.convert("HSV")
+        arr = np.array(hsv).astype(np.int16)
+        h_shift = rng.randint(-40, 40)
+        s_scale = rng.uniform(0.7, 1.3)
+        v_scale = rng.uniform(0.7, 1.3)
+        arr[..., 0] = (arr[..., 0] + h_shift) % 256
+        arr[..., 1] = np.clip(np.round(arr[..., 1] * s_scale), 0, 255)
+        arr[..., 2] = np.clip(np.round(arr[..., 2] * v_scale), 0, 255)
+        out = Image.fromarray(arr.astype(np.uint8), mode="HSV").convert("RGB")
+        return out
 
 
 def add_gaussian_noise(img, rs):
     arr = np.array(img).astype(np.float32)
     sigma = rs.uniform(5.0, 25.0)
-    noise = rs.normal(0.0, sigma, arr.shape).astype(np.float32)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        rgb = arr[..., :3]
+        a = arr[..., 3:4]
+        noise = rs.normal(0.0, sigma, rgb.shape).astype(np.float32)
+        rgb = np.clip(rgb + noise, 0, 255).astype(np.uint8)
+        out = np.concatenate([rgb, a.astype(np.uint8)], axis=-1)
+        return Image.fromarray(out, mode="RGBA")
+    else:
+        noise = rs.normal(0.0, sigma, arr.shape).astype(np.float32)
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
 
 
 def blur_or_sharpen(img, rng):
-    if rng.random() < 0.5:
-        radius = rng.uniform(0.5, 2.0)
-        return img.filter(ImageFilter.GaussianBlur(radius=radius))
+    if "A" in img.getbands():
+        a = img.getchannel("A")
+        rgb = img.convert("RGB")
+        if rng.random() < 0.5:
+            radius = rng.uniform(0.5, 2.0)
+            rgb = rgb.filter(ImageFilter.GaussianBlur(radius=radius))
+        else:
+            radius = rng.uniform(1.0, 2.0)
+            percent = rng.randint(80, 180)
+            threshold = rng.randint(0, 5)
+            rgb = rgb.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+        r, g, b = rgb.split()
+        return Image.merge("RGBA", (r, g, b, a))
     else:
-        radius = rng.uniform(1.0, 2.0)
-        percent = rng.randint(80, 180)
-        threshold = rng.randint(0, 5)
-        return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
+        if rng.random() < 0.5:
+            radius = rng.uniform(0.5, 2.0)
+            return img.filter(ImageFilter.GaussianBlur(radius=radius))
+        else:
+            radius = rng.uniform(1.0, 2.0)
+            percent = rng.randint(80, 180)
+            threshold = rng.randint(0, 5)
+            return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=threshold))
 
 
 def adjust_gamma(img, rng):
     gamma = rng.uniform(0.7, 1.5)
     lut = [min(255, max(0, int(round(255.0 * ((i / 255.0) ** gamma))))) for i in range(256)]
-    return img.point(lut * 3)
+    if "A" in img.getbands():
+        a = img.getchannel("A")
+        rgb = img.convert("RGB").point(lut * 3)
+        r, g, b = rgb.split()
+        return Image.merge("RGBA", (r, g, b, a))
+    else:
+        return img.point(lut * 3)
 
 
 def jpeg_artifact(img, rng):
     q = rng.randint(25, 95)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=q, subsampling=2)
-    buf.seek(0)
-    out = Image.open(buf).convert("RGB")
-    buf.close()
-    return out
+    if "A" in img.getbands():
+        a = img.getchannel("A")
+        rgb = img.convert("RGB")
+        rgb.save(buf, format="JPEG", quality=q, subsampling=2)
+        buf.seek(0)
+        out_rgb = Image.open(buf).convert("RGB")
+        buf.close()
+        r, g, b = out_rgb.split()
+        return Image.merge("RGBA", (r, g, b, a))
+    else:
+        img.save(buf, format="JPEG", quality=q, subsampling=2)
+        buf.seek(0)
+        out = Image.open(buf).convert("RGB")
+        buf.close()
+        return out
 
 
 def maybe_grayscale(img, rng):
     if rng.random() < 0.2:
-        return img.convert("L").convert("RGB")
+        if "A" in img.getbands():
+            a = img.getchannel("A")
+            rgb = img.convert("RGB").convert("L").convert("RGB")
+            r, g, b = rgb.split()
+            return Image.merge("RGBA", (r, g, b, a))
+        else:
+            return img.convert("L").convert("RGB")
     return img
 
 
@@ -138,7 +217,7 @@ def random_affine_shear(img, rng):
 
 
 def augment_once(img, rng, rs):
-    img = img.convert("RGB")
+    img = img.convert("RGBA") if "A" in img.getbands() else img.convert("RGB")
     # Todas as operações são closures aceitando apenas (img), com rng/rs capturados
     ops = [
         lambda im: rotate_and_crop(im, rng.uniform(-30, 30)),
@@ -161,33 +240,70 @@ def augment_once(img, rng, rs):
     return out
 
 
-def process_images(input_dir, output_dir, per_image, seed, out_format, type_class=None):
+def process_images(input_dir, output_dir, per_image, seed, out_format, type_class=None, default=False, max_content=None, workers=None):
     paths = list_images(input_dir)
     if not paths:
         print(f"Nenhuma imagem encontrada em: {input_dir}")
         return
     os.makedirs(output_dir, exist_ok=True)
-    rng = random.Random(seed)
-    rs = np.random.RandomState(seed)
     start = time.time()
     total_out = 0
+    groups = {}
     for p in paths:
-        try:
-            with Image.open(p) as img:
-                base = p.stem
-                # Se a flag de classe estiver definida, organiza em subpasta por classe (bite/idle)
-                if type_class:
-                    out_dir = Path(output_dir) / type_class
-                else:
-                    out_dir = Path(output_dir) / base
-                out_dir.mkdir(parents=True, exist_ok=True)
+        if default:
+            key = p.parent.relative_to(Path(input_dir))
+        elif type_class:
+            key = Path(type_class)
+        else:
+            key = Path(p.stem)
+        groups.setdefault(key, []).append(p)
+
+    if not workers or workers <= 0:
+        workers = max(1, os.cpu_count() or 1)
+
+    jobs = []
+    idx = 0
+
+    for key, imgs in groups.items():
+        out_dir = Path(output_dir) / key
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if max_content is not None:
+            total_needed = max(0, int(max_content))
+            n = len(imgs)
+            if n == 0 or total_needed == 0:
+                continue
+            base_repeat = total_needed // n
+            remainder = total_needed % n
+            counts = [base_repeat + (1 if i < remainder else 0) for i in range(n)]
+            for img_path, count in zip(imgs, counts):
+                base = Path(img_path).stem
+                for i in range(count):
+                    jobs.append((img_path, out_dir, base, i, out_format, seed + idx))
+                    idx += 1
+        else:
+            for img_path in imgs:
+                base = Path(img_path).stem
                 for i in range(per_image):
-                    aug = augment_once(img, rng, rs)
-                    name = f"{base}__aug_{i:05d}.{out_format}"
-                    aug.save(out_dir / name)
-                    total_out += 1
+                    jobs.append((img_path, out_dir, base, i, out_format, seed + idx))
+                    idx += 1
+
+    def _run_job(img_path, out_dir, base, i, out_format, job_seed):
+        try:
+            with Image.open(img_path) as img:
+                rng = random.Random(job_seed)
+                rs = np.random.RandomState(job_seed)
+                aug = augment_once(img, rng, rs)
+                aug = to_white_background(aug)
+                name = f"{base}__aug_{i:05d}.{out_format}"
+                aug.save(out_dir / name)
+                return True
         except Exception as e:
-            print(f"Falha ao processar {p}: {e}")
+            print(f"Falha ao processar {img_path}: {e}")
+            return False
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(lambda j: _run_job(*j), jobs))
+        total_out = sum(1 for r in results if r)
     dur = time.time() - start
     print(f"Concluído: {len(paths)} imagens de entrada, {total_out} geradas em {dur:.1f}s")
 
@@ -200,9 +316,12 @@ def main():
     parser.add_argument("--per-image", type=int, default=200, help="Quantidade de variações por imagem")
     parser.add_argument("--seed", type=int, default=42, help="Semente para reproducibilidade")
     parser.add_argument("--format", choices=["png", "jpg", "jpeg"], default="png", help="Formato de saída")
+    parser.add_argument("--default", action="store_true", help="Espelha a estrutura de pastas de entrada no output")
+    parser.add_argument("--max-content", type=int, help="Quantidade máxima de imagens por pasta no output")
+    parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Quantidade de workers simultâneos")
     args = parser.parse_args()
 
-    process_images(args.input, args.output, args.per_image, args.seed, args.format, args.type)
+    process_images(args.input, args.output, args.per_image, args.seed, args.format, args.type, args.default, args.max_content, args.workers)
 
 
 if __name__ == "__main__":
